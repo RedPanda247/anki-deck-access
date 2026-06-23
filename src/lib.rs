@@ -1,22 +1,78 @@
 use rusqlite::{Connection, Transaction, params};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
+pub struct AnkiDeck {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Flashcard {
+    pub card_id: i64,
+    pub deck_id: i64,
+    /// Clean, separated fields (e.g., fields[0] is Front, fields[1] is Back)
+    pub fields: Vec<String>,
+    pub tags: Vec<String>,
+    pub queue_state: i32,
+}
+
 /// Contains the info of where the database and media assets for the decks are stored in the file system
-pub struct AnkiEnviroment {
+pub struct DeckDatabaseEnvironment {
     db_path: PathBuf,
     media_dir: PathBuf,
 }
 
-pub const DB_SETUP_SQL: &str = "
+/// Contains a connection to the deck database
+pub struct DatabaseConnection {
+    conn: Connection,
+}
+
+impl DatabaseConnection {
+    /// Consumes this wrapper and returns the underlying rusqlite connection.
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
+
+    /// Retrieves a list of all decks stored inside the database by parsing the `col` JSON
+    pub fn get_all_decks(&self) -> Result<Vec<AnkiDeck>, Box<dyn std::error::Error>> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare("SELECT decks FROM col LIMIT 1")?;
+
+        let json_str: String = stmt.query_row([], |row| row.get(0))?;
+
+        // Anki stores decks as a JSON map: {"id_string": {"name": "Deck Name", ...}}
+        #[derive(Deserialize)]
+        struct AnkiDeckRaw {
+            name: String,
+        }
+        let raw_decks: HashMap<String, AnkiDeckRaw> = serde_json::from_str(&json_str)?;
+
+        let decks = raw_decks
+            .into_iter()
+            .filter_map(|(id_str, raw)| {
+                id_str
+                    .parse::<i64>()
+                    .ok()
+                    .map(|id| AnkiDeck { id, name: raw.name })
+            })
+            .collect();
+
+        Ok(decks)
+    }
+}
+
+const DB_SETUP_SQL: &str = "
     CREATE TABLE IF NOT EXISTS col (id integer primary key, crt integer, mod integer, scm integer, ver integer, dats integer, usn integer, ls integer, conf text, models text, decks text, dconf text, tags text);
     CREATE TABLE IF NOT EXISTS notes (id integer primary key, guid text, mid integer, mod integer, usn integer, tags text, flds text, sfld integer, csum integer, flags integer, data text);
     CREATE TABLE IF NOT EXISTS cards (id integer primary key, nid integer, did integer, ord integer, mod integer, usn integer, type integer, queue integer, due integer, ivl integer, factor integer, reps integer, lapses integer, left integer, odue integer, odid integer, flags integer, data text);
     ";
 
-impl AnkiEnviroment {
-    /// Creates a new empty AnkiEnviroment in the specified directory if one does not already exist
+impl DeckDatabaseEnvironment {
+    /// Creates a new empty DeckDatabaseEnvironment in the specified directory if one does not already exist
     pub fn init<P: AsRef<Path>>(base_dir: P) -> Result<Self, Box<dyn std::error::Error>> {
         let base = base_dir.as_ref();
 
@@ -181,22 +237,22 @@ impl AnkiEnviroment {
     }
 
     /// Quick function for connecting to the database with rusqlite
-    pub fn connect_with_rusqlite(
-        &self
-    ) -> Result<Connection, rusqlite::Error> {
-        Connection::open(&self.db_path)
+    pub fn connect_to_database(&self) -> Result<DatabaseConnection, rusqlite::Error> {
+        Ok(DatabaseConnection {
+            conn: Connection::open(&self.db_path)?,
+        })
     }
 }
 
 /// Quick function to extract an apkg file to directory for general testing an learning the library
-/// In real usage you should use the init function to initialize the AnkiEnviroment
+/// In real usage you should use the init function to initialize the DeckDatabaseEnvironment
 /// in desired directory and use import_deck when adding decks
 pub fn extract_deck_to<P: AsRef<Path>>(
     destination_dir: P,
     apkg_path: P,
-) -> Result<AnkiEnviroment, Box<dyn std::error::Error>> {
+) -> Result<DeckDatabaseEnvironment, Box<dyn std::error::Error>> {
     // Init enviroment
-    let enviroment = AnkiEnviroment::init(destination_dir)?;
+    let enviroment = DeckDatabaseEnvironment::init(destination_dir)?;
 
     // Add deck to enviroment
     enviroment.import_deck(apkg_path)?;
