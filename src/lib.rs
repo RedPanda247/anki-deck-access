@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -42,7 +42,13 @@ impl DatabaseConnection {
         let conn = &self.conn;
         let mut stmt = conn.prepare("SELECT decks FROM col LIMIT 1")?;
 
-        let json_str: String = stmt.query_row([], |row| row.get(0))?;
+        let json_str_opt: Option<String> = stmt.query_row([], |row| row.get(0)).optional()?;
+        let Some(json_str) = json_str_opt else {
+            return Ok(Vec::new());
+        };
+        if json_str.trim().is_empty() || json_str.trim() == "null" {
+            return Ok(Vec::new());
+        }
 
         // Anki stores decks as a JSON map: {"id_string": {"name": "Deck Name", ...}}
         #[derive(Deserialize)]
@@ -131,15 +137,17 @@ impl DeckDatabaseEnvironment {
         }
 
         // Merge SQL collections securely
-        let extracted_db_path = if temp_dir.join("collection.anki21b").exists() {
+        let extracted_db_path = if temp_dir.join("collection.anki2").exists() {
+            temp_dir.join("collection.anki2")
+        } else if temp_dir.join("collection.anki21").exists() {
+            temp_dir.join("collection.anki21")
+        } else if temp_dir.join("collection.anki21b").exists() {
             let compressed_path = temp_dir.join("collection.anki21b");
             let decompressed_path = temp_dir.join("collection.anki21.sqlite");
             let compressed = File::open(compressed_path)?;
             let decompressed = zstd::decode_all(compressed)?;
             fs::write(&decompressed_path, decompressed)?;
             decompressed_path
-        } else if temp_dir.join("collection.anki21").exists() {
-            temp_dir.join("collection.anki21")
         } else {
             temp_dir.join("collection.anki2")
         };
@@ -161,6 +169,18 @@ impl DeckDatabaseEnvironment {
         src: &Connection,
         dest_tx: &Transaction,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Copy deck metadata JSON so deck names/ids are available in destination.
+        let src_decks: Option<String> = src
+            .query_row("SELECT decks FROM col LIMIT 1", [], |row| row.get(0))
+            .optional()?;
+        if let Some(decks_json) = src_decks {
+            dest_tx.execute(
+                "INSERT INTO col (id, decks) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET decks = excluded.decks",
+                [decks_json],
+            )?;
+        }
+
         // Look up notes from the extracted source
         let mut note_stmt = src.prepare(
             "SELECT id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data FROM notes",
